@@ -49,7 +49,26 @@ export function createApp(cfg, log = console) {
   async function handleTask(req, res, rawBody) {
     const t0 = Date.now();
 
-    // --- Signature first, before any parsing (per the build guide). ---
+    // --- Parse first (lenient): the platform's preflight probe is a
+    // well-formed JSON body that is NOT a task envelope, and it may arrive
+    // unsigned — the signed hello below is its own authentication. Task
+    // envelopes still go through full signature verification. ---
+    let task = null;
+    try {
+      task = JSON.parse(rawBody.toString("utf8"));
+    } catch {
+      task = null;
+    }
+
+    // --- Preflight probe: any well-formed JSON object without an `input`
+    // object is the platform's health/preflight check. It requires exactly
+    // this signed protocol-v1 hello. ---
+    if (task && typeof task === "object" && (!task.input || typeof task.input !== "object")) {
+      log.info?.(`[agent] preflight probe answered with signed protocol-v1 hello`);
+      return sendSigned(res, 200, { ok: true, protocolVersion: "v1" });
+    }
+
+    // --- Signature check for everything task-shaped (or unparseable). ---
     if (cfg.secret) {
       const headerVal = cfg.sigHeaders
         .map((h) => req.headers[h])
@@ -60,13 +79,6 @@ export function createApp(cfg, log = console) {
       }
     }
 
-    // --- Parse (fail closed: a signed REJECT beats a timeout). ---
-    let task = null;
-    try {
-      task = JSON.parse(rawBody.toString("utf8"));
-    } catch {
-      task = null;
-    }
     if (!task || typeof task !== "object") {
       return sendSigned(res, 200, {
         task_id: null,
@@ -156,6 +168,11 @@ export function createApp(cfg, log = console) {
 
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, "http://localhost");
+    if (req.method === "GET" && url.pathname === "/agent") {
+      // Platform preflight/health probes may also arrive as a plain GET on
+      // the task endpoint: answer with the signed protocol-v1 hello.
+      return sendSigned(res, 200, { ok: true, protocolVersion: "v1" });
+    }
     if (req.method === "GET" && (url.pathname === "/health" || url.pathname === "/")) {
       return sendPlain(res, 200, {
         status: "ok",
